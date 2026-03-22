@@ -1,36 +1,68 @@
-"""tts.py — Yoruba Text-to-Speech via FarmerlineML/yoruba_tts-2025
+"""tts.py — Yoruba Text-to-Speech (dual engine)
 
-Uses VITS architecture with AutoTokenizer, which correctly handles Yoruba
-tonal diacritics (á à é è ó ò etc.). NFC normalization ensures consistent
-Unicode encoding regardless of LLM output encoding.
+Engines:
+  "mms"        — facebook/mms-tts-yor (Meta MMS-TTS, VITS-based)
+  "farmerline" — FarmerlineML/yoruba_tts-2025 (community VITS model)
+
+Both are VITS models. MMS uses AutoProcessor; FarmerlineML uses AutoTokenizer.
+NFC normalization ensures consistent Unicode encoding for Yoruba diacritics.
+Returns (sample_rate, numpy_audio_array) suitable for Gradio's gr.Audio output.
 """
 
 import unicodedata
 
 import torch
 import numpy as np
-from transformers import AutoTokenizer, VitsModel
+from transformers import AutoProcessor, AutoTokenizer, VitsModel
 
-TTS_MODEL_ID = "FarmerlineML/yoruba_tts-2025"
+# Fix: system cuDNN 9.0.0.312 is broken on this machine
+torch.backends.cudnn.enabled = False
+
+ENGINES = {
+    "mms": {
+        "model_id": "facebook/mms-tts-yor",
+        "preprocessor": "processor",
+    },
+    "farmerline": {
+        "model_id": "FarmerlineML/yoruba_tts-2025",
+        "preprocessor": "tokenizer",
+    },
+}
+
+DEFAULT_ENGINE = "farmerline"
 
 
-def load_tts(device: str = "cuda") -> tuple:
-    """Load FarmerlineML TTS tokenizer and model.
+def load_tts(device: str = "cuda", engine: str = DEFAULT_ENGINE) -> tuple:
+    """Load TTS preprocessor and model.
+
+    Args:
+        device: "cuda" or "cpu".
+        engine: "mms" or "farmerline" (default).
 
     Returns:
-        (tokenizer, model, sample_rate) tuple.
+        (preprocessor, model, sample_rate) tuple.
     """
-    print(f"[TTS] Loading {TTS_MODEL_ID}...")
-    tokenizer = AutoTokenizer.from_pretrained(TTS_MODEL_ID)
-    model = VitsModel.from_pretrained(TTS_MODEL_ID).to(device)
+    if engine not in ENGINES:
+        raise ValueError(f"Unknown TTS engine '{engine}'. Choose from: {list(ENGINES.keys())}")
+
+    config = ENGINES[engine]
+    model_id = config["model_id"]
+    print(f"[TTS] Loading {model_id} (engine={engine})...")
+
+    if config["preprocessor"] == "tokenizer":
+        preprocessor = AutoTokenizer.from_pretrained(model_id)
+    else:
+        preprocessor = AutoProcessor.from_pretrained(model_id)
+
+    model = VitsModel.from_pretrained(model_id).to(device)
     model.eval()
     sample_rate = model.config.sampling_rate
     print(f"[TTS] Loaded. Sample rate: {sample_rate} Hz")
-    return tokenizer, model, sample_rate
+    return preprocessor, model, sample_rate
 
 
 def synthesize(
-    tokenizer,
+    preprocessor,
     model,
     sample_rate: int,
     text: str,
@@ -39,9 +71,9 @@ def synthesize(
     """Convert Yoruba text to audio waveform.
 
     Args:
-        tokenizer: VITS AutoTokenizer.
+        preprocessor: AutoProcessor or AutoTokenizer (both support text= kwarg).
         model: Loaded VitsModel.
-        sample_rate: Model native sample rate.
+        sample_rate: Model's native sample rate (typically 16000).
         text: Yoruba text to speak (diacritics preserved).
         device: "cuda" or "cpu".
 
@@ -49,10 +81,10 @@ def synthesize(
         (sample_rate, float32 numpy array) for Gradio.
     """
     text = unicodedata.normalize("NFC", text)
-    inputs = tokenizer(text, return_tensors="pt").to(device)
+    inputs = preprocessor(text=text, return_tensors="pt").to(device)
 
     with torch.no_grad():
         waveform = model(**inputs).waveform
 
-    audio = waveform.squeeze().cpu().numpy().astype(np.float32)
+    audio = waveform.squeeze(0).cpu().numpy().astype(np.float32)
     return sample_rate, audio
