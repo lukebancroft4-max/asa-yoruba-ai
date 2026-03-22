@@ -8,10 +8,6 @@ Uses faster-whisper (CTranslate2, int8) with large-v3 for:
 
 import numpy as np
 import soundfile as sf
-import torch
-
-# Fix: system cuDNN 9.0.0.312 is broken on this machine
-torch.backends.cudnn.enabled = False
 
 from faster_whisper import WhisperModel
 

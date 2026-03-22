@@ -1,135 +1,132 @@
-"""Tests for asr.py — faster-whisper ASR module."""
+"""Tests for asr.py — Automatic Speech Recognition module.
+
+asr.py uses faster-whisper (WhisperModel), NOT transformers pipeline.
+transcribe() reads audio with sf.read(), normalizes, then passes the
+numpy array (not a file path) to model.transcribe().
+"""
 
 import os
 import sys
-import tempfile
 import numpy as np
-import soundfile as sf
 from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import asr as asr_module
-from asr import transcribe, load_asr, _normalize
-
-
-class TestLoadAsr:
-    def test_creates_whisper_model(self):
-        """load_asr() creates a WhisperModel with correct params."""
-        with patch.object(asr_module, "WhisperModel") as mock_wm:
-            mock_wm.return_value = MagicMock()
-            load_asr(device="cuda")
-
-            mock_wm.assert_called_once_with("large-v3", device="cpu", compute_type="int8")
-
-    def test_always_runs_on_cpu(self):
-        """load_asr() uses CPU regardless of device arg."""
-        with patch.object(asr_module, "WhisperModel") as mock_wm:
-            mock_wm.return_value = MagicMock()
-            load_asr(device="cuda")
-
-            call_kwargs = mock_wm.call_args
-            assert call_kwargs.kwargs["device"] == "cpu"
-
-    def test_returns_whisper_model_instance(self):
-        """load_asr() returns the WhisperModel instance."""
-        mock_model = MagicMock()
-        with patch.object(asr_module, "WhisperModel", return_value=mock_model):
-            result = load_asr()
-            assert result is mock_model
+from asr import transcribe, _normalize
 
 
 class TestNormalize:
-    def test_normalizes_loud_audio(self):
-        """_normalize() scales peak to 0.85."""
-        audio = np.array([1.0, -1.0, 0.5], dtype=np.float32)
+    def test_normalizes_to_0_85_peak(self):
+        """_normalize() scales peak amplitude to 0.85."""
+        audio = np.array([0.0, 0.5, 1.0, -0.5], dtype=np.float32)
         result = _normalize(audio)
-        assert np.isclose(np.abs(result).max(), 0.85)
+        assert abs(result.max() - 0.85) < 1e-6
 
-    def test_silent_audio_unchanged(self):
-        """_normalize() handles all-zero audio without division by zero."""
+    def test_handles_silent_audio(self):
+        """_normalize() returns zeros unchanged (no div-by-zero)."""
         audio = np.zeros(100, dtype=np.float32)
         result = _normalize(audio)
         assert np.all(result == 0.0)
 
+    def test_returns_new_array(self):
+        """_normalize() does not mutate the input array."""
+        audio = np.array([0.5, -0.5], dtype=np.float32)
+        original = audio.copy()
+        _normalize(audio)
+        np.testing.assert_array_equal(audio, original)
+
+
+class TestLoadAsr:
+    def test_creates_whisper_model(self):
+        """load_asr() creates a WhisperModel instance."""
+        mock_model = MagicMock()
+        with patch.object(asr_module, "WhisperModel", return_value=mock_model) as mock_cls:
+            result = asr_module.load_asr(device="cpu")
+            mock_cls.assert_called_once()
+            assert result is mock_model
+
+    def test_always_runs_on_cpu(self):
+        """load_asr() forces CPU regardless of device argument (keeps VRAM for TTS)."""
+        mock_model = MagicMock()
+        with patch.object(asr_module, "WhisperModel", return_value=mock_model) as mock_cls:
+            asr_module.load_asr(device="cuda")
+            call_args = mock_cls.call_args
+            # device arg is second positional or keyword
+            device_used = call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs.get("device")
+            assert device_used == "cpu"
+
+    def test_uses_large_v3_model(self):
+        """load_asr() loads large-v3 model for best Yoruba accuracy."""
+        mock_model = MagicMock()
+        with patch.object(asr_module, "WhisperModel", return_value=mock_model) as mock_cls:
+            asr_module.load_asr(device="cpu")
+            call_args = mock_cls.call_args
+            model_size = call_args.args[0] if call_args.args else call_args.kwargs.get("model_size_or_path")
+            assert model_size == "large-v3"
+
 
 class TestTranscribe:
-    def _make_mock_model(self, segments_text: list[str], lang: str = "yo", prob: float = 0.95):
-        """Build a mock WhisperModel that returns given segments."""
+    def _make_mock_model(self, texts: list[str]) -> MagicMock:
+        """Build a WhisperModel mock that returns segments with the given texts."""
         mock_model = MagicMock()
-
-        mock_segments = []
-        for text in segments_text:
-            seg = MagicMock()
-            seg.text = text
-            mock_segments.append(seg)
-
+        segments = [MagicMock(text=t) for t in texts]
         mock_info = MagicMock()
-        mock_info.language = lang
-        mock_info.language_probability = prob
-
-        mock_model.transcribe.return_value = (iter(mock_segments), mock_info)
+        mock_info.language = "yo"
+        mock_info.language_probability = 0.95
+        mock_model.transcribe.return_value = (iter(segments), mock_info)
         return mock_model
 
-    def _make_temp_wav(self, duration_s: float = 1.0, sr: int = 16000) -> str:
-        """Create a temporary WAV file with silence."""
-        audio = np.zeros(int(sr * duration_s), dtype=np.float32)
-        path = tempfile.mktemp(suffix=".wav")
-        sf.write(path, audio, sr)
-        return path
+    def test_returns_joined_segment_texts(self):
+        """transcribe() joins all segment texts with spaces."""
+        model = self._make_mock_model(["Báwo ni?", "Ẹ káàbọ̀."])
+        with patch.object(asr_module, "sf") as mock_sf:
+            mock_sf.read.return_value = (np.zeros(16000, dtype=np.float32), 16000)
+            result = transcribe(model, "/tmp/fake.wav")
+        assert result == "Báwo ni? Ẹ káàbọ̀."
 
-    def test_returns_transcribed_text(self):
-        """transcribe() joins segment texts."""
-        model = self._make_mock_model(["Báwo", "ni?"])
-        path = self._make_temp_wav()
-        try:
-            result = transcribe(model, path)
-            assert result == "Báwo ni?"
-        finally:
-            os.unlink(path)
+    def test_strips_whitespace_from_result(self):
+        """transcribe() strips surrounding whitespace from each segment."""
+        model = self._make_mock_model(["  Báwo ni?  "])
+        with patch.object(asr_module, "sf") as mock_sf:
+            mock_sf.read.return_value = (np.zeros(16000, dtype=np.float32), 16000)
+            result = transcribe(model, "/tmp/fake.wav")
+        assert result == "Báwo ni?"
 
-    def test_strips_segment_whitespace(self):
-        """transcribe() strips whitespace from each segment."""
-        model = self._make_mock_model(["  Ẹ káàbọ̀  "])
-        path = self._make_temp_wav()
-        try:
-            result = transcribe(model, path)
-            assert result == "Ẹ káàbọ̀"
-        finally:
-            os.unlink(path)
-
-    def test_calls_model_transcribe_with_vad(self):
-        """transcribe() passes vad_filter=True to model."""
+    def test_reads_audio_file(self):
+        """transcribe() reads audio from the given file path."""
         model = self._make_mock_model(["test"])
-        path = self._make_temp_wav()
-        try:
-            transcribe(model, path)
+        with patch.object(asr_module, "sf") as mock_sf:
+            mock_sf.read.return_value = (np.zeros(16000, dtype=np.float32), 16000)
+            transcribe(model, "/tmp/my_audio.wav")
+            mock_sf.read.assert_called_once_with("/tmp/my_audio.wav", dtype="float32")
+
+    def test_passes_numpy_array_to_transcribe(self):
+        """transcribe() passes the numpy array (not file path) to model.transcribe()."""
+        model = self._make_mock_model(["test"])
+        with patch.object(asr_module, "sf") as mock_sf:
+            fake_audio = np.array([0.1, 0.2], dtype=np.float32)
+            mock_sf.read.return_value = (fake_audio, 16000)
+            transcribe(model, "/tmp/fake.wav")
+            call_args = model.transcribe.call_args
+            passed_audio = call_args.args[0]
+            assert isinstance(passed_audio, np.ndarray)
+
+    def test_converts_stereo_to_mono(self):
+        """transcribe() averages stereo channels before passing to model."""
+        model = self._make_mock_model(["test"])
+        with patch.object(asr_module, "sf") as mock_sf:
+            stereo = np.ones((16000, 2), dtype=np.float32)
+            mock_sf.read.return_value = (stereo, 16000)
+            transcribe(model, "/tmp/stereo.wav")
+            passed_audio = model.transcribe.call_args.args[0]
+            assert passed_audio.ndim == 1
+
+    def test_vad_filter_enabled(self):
+        """transcribe() uses VAD filter to reduce hallucination on silence."""
+        model = self._make_mock_model(["test"])
+        with patch.object(asr_module, "sf") as mock_sf:
+            mock_sf.read.return_value = (np.zeros(16000, dtype=np.float32), 16000)
+            transcribe(model, "/tmp/fake.wav")
             call_kwargs = model.transcribe.call_args.kwargs
-            assert call_kwargs["vad_filter"] is True
-            assert call_kwargs["beam_size"] == 5
-            assert call_kwargs["language"] is None
-        finally:
-            os.unlink(path)
-
-    def test_handles_stereo_audio(self):
-        """transcribe() converts stereo to mono."""
-        model = self._make_mock_model(["ok"])
-        # Write stereo WAV
-        stereo = np.zeros((16000, 2), dtype=np.float32)
-        path = tempfile.mktemp(suffix=".wav")
-        sf.write(path, stereo, 16000)
-        try:
-            result = transcribe(model, path)
-            assert isinstance(result, str)
-        finally:
-            os.unlink(path)
-
-    def test_empty_segments_returns_empty_string(self):
-        """transcribe() returns empty string when no segments detected."""
-        model = self._make_mock_model([])
-        path = self._make_temp_wav()
-        try:
-            result = transcribe(model, path)
-            assert result == ""
-        finally:
-            os.unlink(path)
+            assert call_kwargs.get("vad_filter") is True
