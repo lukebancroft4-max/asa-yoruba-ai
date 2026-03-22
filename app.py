@@ -1,11 +1,7 @@
 """app.py — Àṣà: Yoruba AI Voice Chat
 
 Full pipeline:
-  Mic/Text → ASR (faster-whisper) → LLM (NVIDIA API Llama-3.3-70B) → TTS (dual engine)
-
-Modes:
-  Chat   — Talk to Àṣà (ASR → LLM → TTS)
-  Speak  — Type English/Yoruba → hear it in Yoruba (translate → TTS, no LLM)
+  Mic/Text → ASR (faster-whisper large-v3) → LLM (NVIDIA Llama-3.3-70B) → TTS (FarmerlineML/yoruba_tts-2025)
 
 Usage:
   cd ~/yoruba_ai
@@ -14,208 +10,174 @@ Usage:
 """
 
 import torch
-
 import gradio as gr
 
 from asr import load_asr, transcribe
-from llm import build_client, chat
-from translate import translate_to_yoruba
-from tts import synthesize
-from tts_engines import load_tts, ENGINES, DEFAULT_ENGINE
+from llm import build_client, chat_stream, MAX_HISTORY_TURNS
+from tts import load_tts, synthesize
 
 # ── Setup ──────────────────────────────────────────────────────────────────────
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"[Àṣà] Starting on device: {DEVICE}")
 
-# Load default TTS + ASR + LLM at startup
 asr_pipeline = load_asr(DEVICE)
-tts_preprocessor, tts_model, tts_sample_rate = load_tts(DEVICE, engine=DEFAULT_ENGINE)
+tts_preprocessor, tts_model, sample_rate = load_tts(DEVICE)
 nvidia_client = build_client()
 
-# Track current engine so we only reload when it changes
-_current_engine = DEFAULT_ENGINE
 
-# Per-session conversation history (resets on "Clear")
-conversation_history: list[dict] = []
+# ── Core pipeline ──────────────────────────────────────────────────────────────
+def run_pipeline(audio_path: str | None, text_input: str, history: list[dict]):
+    """Generator: streams chatbot updates, then yields final audio + state.
 
+    Yields:
+        Tuples of (chatbot_messages, audio_output, new_history).
+    """
+    history = list(history or [])
 
-# ── Engine hot-swap ───────────────────────────────────────────────────────────
-def _ensure_engine(engine: str):
-    """Reload TTS model only if engine changed."""
-    global _current_engine, tts_preprocessor, tts_model, tts_sample_rate
-    if engine != _current_engine:
-        tts_preprocessor, tts_model, tts_sample_rate = load_tts(DEVICE, engine=engine)
-        _current_engine = engine
-
-
-# ── Chat pipeline ─────────────────────────────────────────────────────────────
-def run_pipeline(audio_path: str | None, text_input: str, engine: str):
-    """End-to-end voice/text → voice/text pipeline (ASR → LLM → TTS)."""
-    _ensure_engine(engine)
-
+    # 1. Get user text
     if audio_path:
-        user_text = transcribe(asr_pipeline, audio_path)
+        try:
+            user_text = transcribe(asr_pipeline, audio_path)
+        except Exception as exc:
+            error_history = history + [
+                {"role": "assistant", "content": f"*ASR error: {exc}*"}
+            ]
+            yield error_history, None, history
+            return
     elif text_input.strip():
         user_text = text_input.strip()
     else:
-        return None, "", "Ẹ jẹ́ kí e sọ̀rọ̀ tàbí tẹ ọ̀rọ̀ kan. (Please speak or type.)"
+        prompt = history + [
+            {
+                "role": "assistant",
+                "content": "Ẹ jẹ́ kí e sọ̀rọ̀ tàbí tẹ ọ̀rọ̀ kan. (Please speak or type.)",
+            }
+        ]
+        yield prompt, None, history
+        return
 
-    reply_text = chat(nvidia_client, conversation_history, user_text)
-    audio_out = synthesize(tts_preprocessor, tts_model, tts_sample_rate, reply_text, DEVICE)
+    # 2. Show user message immediately
+    pending = history + [
+        {"role": "user", "content": user_text},
+        {"role": "assistant", "content": "..."},
+    ]
+    yield pending, None, history
 
-    return audio_out, user_text, reply_text
+    # 3. Stream LLM reply
+    partial = ""
+    try:
+        for chunk in chat_stream(nvidia_client, history, user_text):
+            partial += chunk
+            streaming = history + [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": partial},
+            ]
+            yield streaming, None, history
+    except Exception as exc:
+        error_display = history + [
+            {"role": "user", "content": user_text},
+            {"role": "assistant", "content": f"*LLM error: {exc}*"},
+        ]
+        yield error_display, None, history
+        return
 
+    # 4. Build final history (trimmed)
+    new_history = (
+        history + [
+            {"role": "user", "content": user_text},
+            {"role": "assistant", "content": partial},
+        ]
+    )[-MAX_HISTORY_TURNS:]
 
-# ── Speak pipeline (translate → TTS, no LLM) ─────────────────────────────────
-def run_speak(text_input: str, lang: str, engine: str):
-    """Direct text-to-speech: optionally translate English → Yoruba, then TTS."""
-    _ensure_engine(engine)
+    # 5. Synthesize TTS
+    audio_out = None
+    try:
+        audio_out = synthesize(tts_preprocessor, tts_model, sample_rate, partial, DEVICE)
+    except Exception as exc:
+        print(f"[TTS] Error: {exc}")
 
-    if not text_input.strip():
-        return None, ""
-
-    text = text_input.strip()
-
-    if lang == "English (auto-translate)":
-        yoruba = translate_to_yoruba(text)
-        display = f"{text}\n→ {yoruba}"
-    else:
-        yoruba = text
-        display = yoruba
-
-    audio_out = synthesize(tts_preprocessor, tts_model, tts_sample_rate, yoruba, DEVICE)
-    return audio_out, display
+    yield new_history, audio_out, new_history
 
 
 def clear_session():
-    conversation_history.clear()
-    return None, "", ""
+    """Reset chatbot, audio, and history state."""
+    return [], None, []
 
 
 # ── Gradio UI ──────────────────────────────────────────────────────────────────
-with gr.Blocks(title="Àṣà — Yoruba AI", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="Àṣà — Yoruba AI") as demo:
+    history_state = gr.State([])
+
     gr.Markdown(
         """
-# Àṣà — Bá mi sọ̀rọ̀!
-**Yoruba AI Voice Assistant** · ASR + Llama-3.3-70B + Dual TTS + NLLB Translation
+# 🗣️ Àṣà — Bá mi sọ̀rọ̀!
+**Yoruba AI Voice Assistant** · faster-whisper ASR + Llama-3.3-70B + FarmerlineML TTS
+
+Speak or type in Yoruba (or English) — Àṣà replies in fluent Yoruba with proper tones.
         """
     )
 
-    engine_selector = gr.Dropdown(
-        choices=list(ENGINES.keys()),
-        value=DEFAULT_ENGINE,
-        label="TTS Engine",
+    chatbot = gr.Chatbot(
+        label="Chat with Àṣà",
+        height=400,
     )
 
-    with gr.Tabs():
-        # ── Tab 1: Chat ──
-        with gr.Tab("Chat with Àṣà"):
-            with gr.Row():
-                with gr.Column(scale=1):
-                    audio_input = gr.Audio(
-                        sources=["microphone"],
-                        type="filepath",
-                        label="Sọ̀rọ̀ (Speak)",
-                    )
-                    chat_text_input = gr.Textbox(
-                        placeholder="Tàbí tẹ ọ̀rọ̀ rẹ níhìn... (Or type here...)",
-                        label="Tẹ ọ̀rọ̀ (Type)",
-                        lines=2,
-                    )
-                    with gr.Row():
-                        submit_btn = gr.Button("Firanṣẹ (Send)", variant="primary")
-                        clear_btn = gr.Button("Clear")
+    audio_output = gr.Audio(
+        label="🔊 Àṣà says...",
+        autoplay=True,
+        interactive=False,
+    )
 
-                with gr.Column(scale=1):
-                    chat_audio_out = gr.Audio(
-                        label="Àṣà says...",
-                        autoplay=True,
-                        interactive=False,
-                    )
-                    user_text_out = gr.Textbox(
-                        label="You said:", interactive=False, lines=2
-                    )
-                    reply_text_out = gr.Textbox(
-                        label="Àṣà replied:", interactive=False, lines=4
-                    )
+    with gr.Row():
+        audio_input = gr.Audio(
+            sources=["microphone"],
+            type="filepath",
+            label="🎙️ Sọ̀rọ̀ (Speak)",
+        )
+        text_input = gr.Textbox(
+            placeholder="Tàbí tẹ ọ̀rọ̀ rẹ níhìn... (Or type here...)",
+            label="Tẹ ọ̀rọ̀ (Type)",
+            lines=2,
+            scale=2,
+        )
 
-            gr.Examples(
-                examples=[
-                    [None, "Báwo ni?"],
-                    [None, "Kí ni orúkọ rẹ?"],
-                    [None, "Ṣe ó dára láti kọ̀ èdè Yorùbá?"],
-                    [None, "Tell me a Yoruba proverb about patience"],
-                ],
-                inputs=[audio_input, chat_text_input],
-                label="Try these examples",
-            )
+    with gr.Row():
+        submit_btn = gr.Button("➤ Firanṣẹ (Send)", variant="primary")
+        clear_btn = gr.Button("🗑️ Clear")
 
-            submit_btn.click(
-                fn=run_pipeline,
-                inputs=[audio_input, chat_text_input, engine_selector],
-                outputs=[chat_audio_out, user_text_out, reply_text_out],
-            )
-            chat_text_input.submit(
-                fn=run_pipeline,
-                inputs=[audio_input, chat_text_input, engine_selector],
-                outputs=[chat_audio_out, user_text_out, reply_text_out],
-            )
-            clear_btn.click(
-                fn=clear_session,
-                outputs=[chat_audio_out, user_text_out, reply_text_out],
-            )
+    gr.Examples(
+        examples=[
+            [None, "Báwo ni?"],
+            [None, "Kí ni orúkọ rẹ?"],
+            [None, "Ṣe ó dára láti kọ̀ èdè Yorùbá?"],
+            [None, "Tell me a Yoruba proverb about patience"],
+        ],
+        inputs=[audio_input, text_input],
+        label="Try these examples",
+    )
 
-        # ── Tab 2: Speak ──
-        with gr.Tab("Speak (TTS only)"):
-            gr.Markdown("Type English or Yoruba text and hear it spoken in Yoruba.")
-            with gr.Row():
-                with gr.Column(scale=1):
-                    speak_text = gr.Textbox(
-                        placeholder="Type text to speak...",
-                        label="Text",
-                        lines=3,
-                    )
-                    speak_lang = gr.Radio(
-                        choices=["English (auto-translate)", "Yoruba (direct)"],
-                        value="English (auto-translate)",
-                        label="Input language",
-                    )
-                    speak_btn = gr.Button("Sọ (Speak)", variant="primary")
+    submit_btn.click(
+        fn=run_pipeline,
+        inputs=[audio_input, text_input, history_state],
+        outputs=[chatbot, audio_output, history_state],
+    )
 
-                with gr.Column(scale=1):
-                    speak_audio_out = gr.Audio(
-                        label="Audio output",
-                        autoplay=True,
-                        interactive=False,
-                    )
-                    speak_display = gr.Textbox(
-                        label="Translation", interactive=False, lines=3
-                    )
+    text_input.submit(
+        fn=run_pipeline,
+        inputs=[audio_input, text_input, history_state],
+        outputs=[chatbot, audio_output, history_state],
+    )
 
-            gr.Examples(
-                examples=[
-                    ["Good morning, how are you?"],
-                    ["The market opens at 8 o'clock"],
-                    ["I love learning Yoruba"],
-                ],
-                inputs=[speak_text],
-                label="English examples (auto-translated)",
-            )
+    clear_btn.click(
+        fn=clear_session,
+        outputs=[chatbot, audio_output, history_state],
+    )
 
-            speak_btn.click(
-                fn=run_speak,
-                inputs=[speak_text, speak_lang, engine_selector],
-                outputs=[speak_audio_out, speak_display],
-            )
-            speak_text.submit(
-                fn=run_speak,
-                inputs=[speak_text, speak_lang, engine_selector],
-                outputs=[speak_audio_out, speak_display],
-            )
 
 if __name__ == "__main__":
     demo.launch(
         server_port=7860,
         share=False,
         show_error=True,
+        theme=gr.themes.Soft(),
     )
