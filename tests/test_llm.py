@@ -24,13 +24,11 @@ class TestBuildClient:
     def test_raises_when_no_api_key(self):
         """build_client() raises ValueError if no key found."""
         import pytest
-        env_backup = os.environ.pop("NVIDIA_API_KEY", None)
-        try:
+        with patch.dict(os.environ, {}, clear=True):
+            # Remove NVIDIA_API_KEY if present so the env is clean
+            os.environ.pop("NVIDIA_API_KEY", None)
             with pytest.raises(ValueError, match="NVIDIA_API_KEY"):
                 llm_module.build_client(api_key=None)
-        finally:
-            if env_backup:
-                os.environ["NVIDIA_API_KEY"] = env_backup
 
     def test_explicit_key_overrides_env(self):
         """Explicit api_key parameter takes precedence over env var."""

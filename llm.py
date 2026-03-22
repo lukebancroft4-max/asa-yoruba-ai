@@ -71,7 +71,7 @@ def chat(
         max_tokens=max_tokens,
     )
 
-    reply = response.choices[0].message.content.strip()
+    reply = (response.choices[0].message.content or "").strip()
     return reply, new_history + [{"role": "assistant", "content": reply}]
 
 
