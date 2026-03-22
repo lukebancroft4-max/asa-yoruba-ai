@@ -1,12 +1,10 @@
-# Yoruba AI — requirements for ~/ai-env/ (most already installed)
-# Run: ~/ai-env/bin/pip install -r requirements.txt
+# Yoruba AI — pinned for HF Spaces reproducibility
+# Install: ~/ai-env/bin/pip install -r requirements.txt
 
-gradio>=6.0.0
-transformers>=4.40.0
+gradio==6.9.0
+transformers==5.3.0
+faster-whisper==1.2.1
 torch>=2.0.0
-soundfile>=0.12.0
-openai>=1.0.0        # NVIDIA API uses OpenAI-compatible client
-numpy>=1.24.0
-scipy>=1.10.0        # WAV writing in speak.py CLI
-sentencepiece>=0.1.99 # NLLB-200 tokenizer
-faster-whisper>=1.0.0 # ASR engine
+soundfile==0.13.1
+openai==2.21.0
+numpy==2.4.2
