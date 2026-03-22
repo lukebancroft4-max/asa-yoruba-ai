@@ -1,4 +1,4 @@
-"""Tests for tts.py — dual-engine TTS module."""
+"""Tests for tts.py and tts_engines.py — single + dual engine TTS."""
 
 import os
 import sys
@@ -11,7 +11,9 @@ from unittest.mock import patch, MagicMock
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import tts as tts_module
-from tts import synthesize, load_tts, ENGINES, DEFAULT_ENGINE
+import tts_engines as engines_module
+from tts import synthesize
+from tts_engines import load_tts, ENGINES, DEFAULT_ENGINE
 
 
 def _make_mock_tts_components(audio_length: int = 16000):
@@ -43,44 +45,13 @@ class TestEngineConfig:
 
 
 class TestLoadTts:
-    def test_returns_preprocessor_model_and_sample_rate(self):
-        """load_tts() returns (preprocessor, model, sample_rate) tuple."""
-        mock_preprocessor = MagicMock()
-        mock_model = MagicMock()
-        mock_model.config.sampling_rate = 22050
-        mock_model.to.return_value = mock_model
-
-        with (
-            patch.object(tts_module, "AutoTokenizer") as mock_at,
-            patch.object(tts_module, "VitsModel") as mock_vm,
-        ):
-            mock_at.from_pretrained.return_value = mock_preprocessor
-            mock_vm.from_pretrained.return_value = mock_model
-
-            preprocessor, model, sr = load_tts(device="cpu", engine="farmerline")
-
-        assert preprocessor is mock_preprocessor
-        assert model is mock_model
-        assert sr == 22050
-
-    def test_farmerline_uses_auto_tokenizer(self):
-        """Farmerline engine uses AutoTokenizer."""
-        mock_model = MagicMock()
-        mock_model.config.sampling_rate = 22050
-        mock_model.to.return_value = mock_model
-
-        with (
-            patch.object(tts_module, "AutoTokenizer") as mock_at,
-            patch.object(tts_module, "AutoProcessor") as mock_ap,
-            patch.object(tts_module, "VitsModel") as mock_vm,
-        ):
-            mock_at.from_pretrained.return_value = MagicMock()
-            mock_vm.from_pretrained.return_value = mock_model
-
-            load_tts(device="cpu", engine="farmerline")
-
-            mock_at.from_pretrained.assert_called_once_with("FarmerlineML/yoruba_tts-2025")
-            mock_ap.from_pretrained.assert_not_called()
+    def test_farmerline_delegates_to_base_tts(self):
+        """load_tts(engine='farmerline') delegates to base tts.load_tts."""
+        mock_result = (MagicMock(), MagicMock(), 22050)
+        with patch.object(engines_module, "_load_farmerline", return_value=mock_result) as mock_fn:
+            result = load_tts(device="cpu", engine="farmerline")
+            mock_fn.assert_called_once_with(device="cpu")
+            assert result == mock_result
 
     def test_mms_uses_auto_processor(self):
         """MMS engine uses AutoProcessor."""
@@ -89,9 +60,8 @@ class TestLoadTts:
         mock_model.to.return_value = mock_model
 
         with (
-            patch.object(tts_module, "AutoTokenizer") as mock_at,
-            patch.object(tts_module, "AutoProcessor") as mock_ap,
-            patch.object(tts_module, "VitsModel") as mock_vm,
+            patch.object(engines_module, "AutoProcessor") as mock_ap,
+            patch.object(engines_module, "VitsModel") as mock_vm,
         ):
             mock_ap.from_pretrained.return_value = MagicMock()
             mock_vm.from_pretrained.return_value = mock_model
@@ -99,20 +69,19 @@ class TestLoadTts:
             load_tts(device="cpu", engine="mms")
 
             mock_ap.from_pretrained.assert_called_once_with("facebook/mms-tts-yor")
-            mock_at.from_pretrained.assert_not_called()
 
     def test_model_moved_to_correct_device(self):
-        """load_tts() calls model.to(device)."""
+        """load_tts() with MMS engine calls model.to(device)."""
         mock_model = MagicMock()
-        mock_model.config.sampling_rate = 22050
+        mock_model.config.sampling_rate = 16000
         mock_model.to.return_value = mock_model
 
         with (
-            patch.object(tts_module, "AutoTokenizer"),
-            patch.object(tts_module, "VitsModel") as mock_vm,
+            patch.object(engines_module, "AutoProcessor"),
+            patch.object(engines_module, "VitsModel") as mock_vm,
         ):
             mock_vm.from_pretrained.return_value = mock_model
-            load_tts(device="cpu", engine="farmerline")
+            load_tts(device="cpu", engine="mms")
 
         mock_model.to.assert_called_once_with("cpu")
 
@@ -120,6 +89,43 @@ class TestLoadTts:
         """load_tts() raises ValueError for unknown engine."""
         with pytest.raises(ValueError, match="Unknown TTS engine"):
             load_tts(device="cpu", engine="nonexistent")
+
+
+class TestBaseTtsLoadTts:
+    def test_returns_tokenizer_model_and_sample_rate(self):
+        """Base load_tts() returns (tokenizer, model, sample_rate) tuple."""
+        mock_tokenizer = MagicMock()
+        mock_model = MagicMock()
+        mock_model.config.sampling_rate = 22050
+        mock_model.to.return_value = mock_model
+
+        with (
+            patch.object(tts_module, "AutoTokenizer") as mock_at,
+            patch.object(tts_module, "VitsModel") as mock_vm,
+        ):
+            mock_at.from_pretrained.return_value = mock_tokenizer
+            mock_vm.from_pretrained.return_value = mock_model
+
+            tokenizer, model, sr = tts_module.load_tts(device="cpu")
+
+        assert tokenizer is mock_tokenizer
+        assert model is mock_model
+        assert sr == 22050
+
+    def test_loads_farmerlineml_model(self):
+        """Base load_tts() loads FarmerlineML model."""
+        mock_model = MagicMock()
+        mock_model.config.sampling_rate = 22050
+        mock_model.to.return_value = mock_model
+
+        with (
+            patch.object(tts_module, "AutoTokenizer") as mock_at,
+            patch.object(tts_module, "VitsModel") as mock_vm,
+        ):
+            mock_vm.from_pretrained.return_value = mock_model
+            tts_module.load_tts(device="cpu")
+
+            mock_at.from_pretrained.assert_called_once_with("FarmerlineML/yoruba_tts-2025")
 
 
 class TestSynthesize:
@@ -155,18 +161,13 @@ class TestSynthesize:
         synthesize(preprocessor, model, 16000, "Ẹ káàbọ̀", device="cpu")
         model.assert_called_once()
 
-    def test_preprocessor_called_with_text_kwarg(self):
-        """synthesize() passes text= keyword to preprocessor (works for both engines)."""
-        preprocessor, model = _make_mock_tts_components()
-        synthesize(preprocessor, model, 16000, "Kí ni orúkọ rẹ?", device="cpu")
-        preprocessor.assert_called_once_with(
-            text="Kí ni orúkọ rẹ?", return_tensors="pt"
-        )
-
     def test_nfc_normalization_applied(self):
         """synthesize() normalizes text to NFC before tokenizing."""
         preprocessor, model = _make_mock_tts_components()
         nfd_text = "Ba\u0301wo ni"
         nfc_text = unicodedata.normalize("NFC", nfd_text)
         synthesize(preprocessor, model, 16000, nfd_text, device="cpu")
-        preprocessor.assert_called_once_with(text=nfc_text, return_tensors="pt")
+        # Check NFC form was passed (either as text= kwarg or positional)
+        call_args = preprocessor.call_args
+        passed_text = call_args.kwargs.get("text") or call_args.args[0]
+        assert passed_text == nfc_text
