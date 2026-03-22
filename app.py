@@ -81,13 +81,14 @@ def run_pipeline(audio_path: str | None, text_input: str, history: list[dict]):
         yield error_display, None, history
         return
 
-    # 4. Build final history (trimmed)
+    # 4. Build final history (trimmed to even boundary so we never split a user+assistant pair)
+    _trim_count = MAX_HISTORY_TURNS - (MAX_HISTORY_TURNS % 2)
     new_history = (
         history + [
             {"role": "user", "content": user_text},
             {"role": "assistant", "content": partial},
         ]
-    )[-MAX_HISTORY_TURNS:]
+    )[-_trim_count:]
 
     # 5. Synthesize TTS
     audio_out = None
