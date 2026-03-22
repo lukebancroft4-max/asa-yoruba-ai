@@ -2,7 +2,7 @@
 
 Engines:
   "mms"        — facebook/mms-tts-yor (Meta MMS-TTS, VITS-based)
-  "farmerline" — FarmerlineML/yoruba_tts-2025 (community VITS model)
+  "farmerline" — FarmerlineML/yoruba_tts-2025 (community VITS model, default)
 
 Both are VITS models. MMS uses AutoProcessor; FarmerlineML uses AutoTokenizer.
 NFC normalization ensures consistent Unicode encoding for Yoruba diacritics.
@@ -14,9 +14,6 @@ import unicodedata
 import torch
 import numpy as np
 from transformers import AutoProcessor, AutoTokenizer, VitsModel
-
-# Fix: system cuDNN 9.0.0.312 is broken on this machine
-torch.backends.cudnn.enabled = False
 
 ENGINES = {
     "mms": {
@@ -37,7 +34,7 @@ def load_tts(device: str = "cuda", engine: str = DEFAULT_ENGINE) -> tuple:
 
     Args:
         device: "cuda" or "cpu".
-        engine: "mms" or "farmerline" (default).
+        engine: "mms" or "farmerline" (default: farmerline for better pronunciation).
 
     Returns:
         (preprocessor, model, sample_rate) tuple.
@@ -73,7 +70,7 @@ def synthesize(
     Args:
         preprocessor: AutoProcessor or AutoTokenizer (both support text= kwarg).
         model: Loaded VitsModel.
-        sample_rate: Model's native sample rate (typically 16000).
+        sample_rate: Model's native sample rate.
         text: Yoruba text to speak (diacritics preserved).
         device: "cuda" or "cpu".
 
